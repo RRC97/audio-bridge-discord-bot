@@ -1,390 +1,143 @@
 # ARCHITECTURE.md
 
-## Diagrama de Componentes
+## Visão Geral da Arquitetura (Web Screen Share Audio Capture)
+
+O **audio-bridge** adota um modelo de arquitetura baseada em **Ponte Web (Web-to-Discord Bridge)**.
+Como o bot roda em um servidor remoto (Docker/AWS) e não possui acesso direto ao hardware ou aos drivers de áudio do computador do usuário, ele utiliza APIs nativas do navegador (`getDisplayMedia`) para que o usuário compartilhe o áudio do seu sistema, aplicativo ou aba com o bot através de uma página web temporária e criptografada.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                       Discord Client                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐ │
-│  │  /join   │  │  /leave  │  │ /select  │  │ /play /pause │ │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └──────┬───────┘ │
-│       │              │              │               │         │
-│       └──────────────┴──────┬───────┴───────────────┘         │
-│                             ▼                                 │
-│                    ┌─────────────────┐                        │
-│                    │  UserSessionMap │                        │
-│                    │ Map<userId,     │                        │
-│                    │   UserSession>  │                        │
-│                    └────────┬────────┘                        │
-│                             │                                 │
-│              ┌──────────────┼──────────────┐                  │
-│              ▼              ▼              ▼                  │
-│     ┌────────────┐ ┌─────────────┐ ┌──────────────┐          │
-│     │VoiceConn.  │ │AudioPlayer  │ │AudioCapturer │          │
-│     │(WebRTC)    │ │(@discordjs) │ │(factory)     │          │
-│     └─────┬──────┘ └──────┬──────┘ └──────┬───────┘          │
-│           │               │               │                   │
-└───────────┼───────────────┼───────────────┼───────────────────┘
-            │               │               │
-            ▼               ▼               ▼
-   ┌────────────┐  ┌──────────────┐  ┌────────────────┐
-   │ Discord    │  │ OpusEncoder  │  │ Native Process │
-   │ Voice UDP  │  │ (s16le→Opus) │  │ (parec/ffmpeg) │
-   └────────────┘  └──────────────┘  └────────────────┘
-```
-
-## Core: Pipeline de Áudio
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│ 1. CAPTURE                                                    │
-│ Processo nativo (parec/ffmpeg) → stdout = PCM raw             │
-│                                                               │
-│ Formato: s16le (signed 16-bit little-endian)                  │
-│ Sample rate: 48000 Hz                                         │
-│ Channels: 2 (stereo)                                          │
-│ Frame size: 960 samples/ch = 1920 samples = 3840 bytes        │
-│ Frame duration: 20ms                                          │
-├───────────────────────────────────────────────────────────────┤
-│ 2. ENCODE                                                     │
-│ Buffer de bytes (3840) → OpusEncoder.encode() → Opus frame    │
-│                                                               │
-│ Library: @discordjs/opus (preferido) ou opusscript (fallback) │
-│ Application: OPUS_APPLICATION_AUDIO                           │
-├───────────────────────────────────────────────────────────────┤
-│ 3. STREAM                                                     │
-│ Frames Opus → Node.js Readable stream (push-based)            │
-│                                                               │
-│ StreamType.Opus — frames Opus sem container (sem Ogg/WebM)    │
-├───────────────────────────────────────────────────────────────┤
-│ 4. RESOURCE                                                   │
-│ Readable → createAudioResource(stream, {                      │
-│   inputType: StreamType.Opus,                                 │
-│   inlineVolume: false (default, performance)                  │
-│ })                                                            │
-├───────────────────────────────────────────────────────────────┤
-│ 5. PLAY                                                       │
-│ AudioPlayer.play(resource) → VoiceConnection.subscribe(player)│
-│                                                               │
-│ Discord gerencia o buffer/playout via WebRTC para o canal     │
-└───────────────────────────────────────────────────────────────┘
-```
-
-## Interface AudioCapturer
-
-Abstração que esconde a complexidade de cada SO e tipo de fonte:
-
-```ts
-type AudioSourceType = 'system' | 'application' | 'browser-tab';
-
-interface AudioSource {
-  id: string;        // identificador interno (ex: sink input index)
-  name: string;      // nome amigável (ex: "Firefox", "Spotify")
-  type: AudioSourceType;
-}
-
-interface AudioCapturer {
-  readonly sourceType: AudioSourceType;
-  readonly sourceId?: string;       // específico para app/browser-tab
-
-  /** Stage 2+: lista fontes de áudio disponíveis (apps rodando) */
-  listSources?(): Promise<AudioSource[]>;
-
-  /** Inicia captura e retorna stream Readable de PCM */
-  start(): Readable;
-
-  /** Para captura e mata processo nativo */
-  stop(): void;
-}
-```
-
-### Implementações por SO
-
-```
-AudioCapturer
-├── LinuxSystemCapturer    (parec --format=s16le --rate=48000 --channels=2)
-├── LinuxAppCapturer       (parec --monitor-stream=<idx>)
-├── WindowsSystemCapturer  (ffmpeg -f dshow -i audio="Stereo Mix")
-├── WindowsAppCapturer     (ffmpeg -f dshow -i audio="...") — requer pesquisa
-└── BrowserTabCapturer     (Stage 3: extensão + WebSocket local)
-```
-
-### Factory
-
-```ts
-function createCapturer(type: AudioSourceType, options?: { sourceId?: string }): AudioCapturer {
-  switch (process.platform) {
-    case 'linux':  return createLinuxCapturer(type, options);
-    case 'win32':  return createWindowsCapturer(type, options);
-    default:
-      throw new Error(`Plataforma não suportada: ${process.platform}`);
-  }
-}
-```
-
-## Gerenciamento de Estado (UserSession)
-
-Cada usuário tem uma sessão isolada:
-
-```ts
-interface UserSession {
-  userId: string;
-  guildId: string;
-  voiceChannelId: string | null;
-  connection: VoiceConnection | null;
-  player: AudioPlayer;
-  capturer: AudioCapturer | null;
-  selectedSource: AudioSourceType | null;
-  selectedSourceId: string | null;   // app name ou tab id
-  isPlaying: boolean;
-}
-```
-
-Armazenado em `userSessions: Map<string, UserSession>`.
-
-### Diagrama de Transições de Estado
-
-```
-                  /join
-    [IDLE] ──────────────────► [CONNECTED]
-                                    │
-                              /select
-                                    ▼
-                              [SOURCE_SELECTED]
-                                    │
-                               /play
-                                    ▼
-                              [PLAYING] ◄──────────┐
-                                    │               │
-                              /pause               /play
-                                    ▼               │
-                              [PAUSED] ─────────────┘
-                                    │
-                    /leave ou /select (troca fonte)
+┌────────────────────────────────────────────────────────────────────────┐
+│                          DISCORD DISPATCHER                            │
+│  Usuário no Discord executa /play ──► Bot responde com URL Criptografada│
+└───────────────────────────────────┬────────────────────────────────────┘
                                     │
                                     ▼
-    [IDLE] ◄───────────────── [CONNECTED]
+┌────────────────────────────────────────────────────────────────────────┐
+│                           BROWSER FRONTEND                             │
+│  1. Usuário abre https://bridge.audio-bot.com/stream?token=XYZ...      │
+│  2. Exibe botão "Iniciar Compartilhamento de Áudio"                   │
+│  3. Chama navigator.mediaDevices.getDisplayMedia({ audio: true })      │
+│  4. Captura a faixa de áudio (Sistema / App / Aba)                     │
+│  5. Transmite áudio criptografado via WSS / WebRTC (vídeo descartado)  │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                        NODE.JS AUDIO BRIDGE SERVER                     │
+│  1. Valida token da sessão (vinculado ao userId e guildId)            │
+│  2. Recebe o stream de áudio via WebSocket (WSS) com TLS               │
+│  3. Transforma o PCM/WebM em Opus Frames (@discordjs/opus)             │
+│  4. Injeta os frames no AudioPlayer da VoiceConnection                 │
+│  5. Monitora temporizador da sessão (1 hora free / ilimitado doadores) │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                          DISCORD VOICE CHANNEL                         │
+│  Áudio é transmitido em alta fidelidade no canal de voz via WebRTC/UDP  │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Interações entre Comandos e Estado
+---
 
-| Estado Atual | `/join` | `/leave` | `/select` | `/play` | `/pause` |
-|---|---|---|---|---|---|
-| **IDLE** | Entra no canal | NOP (já fora) | Erro: use /join | Erro: use /join | Erro: nada tocando |
-| **CONNECTED** | Erro: já está | Sai do canal | Seleciona fonte | Inicia stream | Erro: nada selecionado |
-| **SOURCE_SELECTED** | Sai e re-entra | Sai do canal | Troca fonte | Inicia stream | Erro: não está tocando |
-| **PLAYING** | Sai e re-entra | Sai do canal | Troca fonte | Erro: já tocando | Pausa |
-| **PAUSED** | Sai e re-entra | Sai do canal | Troca fonte | Retoma | Erro: já pausado |
+## Componentes da Arquitetura
 
-## Fluxo de Comando Detalhado
+### 1. Bot Discord (`src/bot/`)
+- **Comandos Slash**:
+  - `/play`: Inicializa a sessão, conecta o bot no canal de voz do usuário, gera um **Token de Sessão HMAC/UUID** e retorna um link ephemeral com a página web de captura.
+  - `/pause`: Pausa o envio de áudio no player.
+  - `/leave`: Encerra a conexão de voz, invalida a URL de streaming e libera a instância/container.
+  - `/status`: Exibe tempo restante da sessão e status da transmissão.
+- **State Management**:
+  - `UserSessionMap`: Mantém o estado ativo de cada usuário:
+    ```ts
+    interface UserSession {
+      userId: string;
+      guildId: string;
+      voiceChannelId: string;
+      sessionToken: string;
+      connection: VoiceConnection | null;
+      player: AudioPlayer;
+      isStreaming: boolean;
+      isDonor: boolean;
+      startedAt: number;
+      expiresAt: number | null; // null se doador (ilimitado), startedAt + 3600s para free
+      timerTimeoutId?: NodeJS.Timeout;
+    }
+    ```
 
-### `/join`
+### 2. Ponte Web / Frontend de Captura (`src/web/public/`)
+- Página web moderna e simplificada.
+- Utiliza a API `navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })` ou `getUserMedia`.
+- O navegador exibe a caixa de diálogo nativa do sistema operacional permitindo escolher:
+  - **Tela Cheia** (captura áudio do sistema todo)
+  - **Janela do Aplicativo** (captura áudio de um app específico, como jogos ou Spotify)
+  - **Aba do Navegador** (captura áudio do YouTube, SoundCloud, etc.)
+- O Javascript no cliente desativa a track de vídeo (`track.stop()` ou não envia pelo socket) para economizar processamento e largura de banda.
+- Envia os chunks de áudio via WebSocket seguro (WSS) ou WebRTC Data/Media Track para o servidor Node.js.
 
-```
-interactionCreate → /join handler
-  │
-  ├─ Valida que usuário está em canal de voz
-  │   └─ Se não: reply ephemeral "Entre em um canal de voz primeiro"
-  │
-  ├─ Cria ou obtém UserSession
-  │
-  ├─ joinVoiceChannel({ channelId, guildId, adapterCreator })
-  │
-  ├─ Aguarda conexão Ready (entersState com timeout)
-  │
-  ├─ Cria AudioPlayer e subscreve à connection
-  │
-  ├─ Armazena connection e player na UserSession
-  │
-  └─ reply ephemeral "Conectado ao canal ${channel.name}"
-```
+### 3. Servidor de Transmissão & Audio Pipeline (`src/audio/`)
+- Recebe o stream do navegador.
+- Decodifica para PCM raw (`s16le`, 48000Hz, estéreo).
+- Converte os dados para Opus via `@discordjs/opus`.
+- Conecta a stream no `createAudioResource()` do `@discordjs/voice`.
+- Envia para o canal de voz com baixa latência.
 
-### `/select`
+---
 
-```
-interactionCreate → /select handler
-  │
-  ├─ Obtém UserSession (criada pelo /join)
-  │   └─ Se não existe: reply ephemeral "Use /join primeiro"
-  │
-  ├─ Lê subcomando: system | app
-  │
-  ├─ Se system:
-  │   ├─ Cria SystemCapturer via factory
-  │   ├─ Armazena na UserSession.selectedSource = 'system'
-  │   └─ reply ephemeral "Fonte: áudio do sistema"
-  │
-  ├─ Se app:
-  │   ├─ Se Stage 2 não implementado ainda: reply ephemeral "Em breve!"
-  │   ├─ Lista apps com AudioCapturer.listSources()
-  │   ├─ Mostra opções pro usuário (select menu ou autocomplete)
-  │   ├─ Armazena capturer com sourceId do app escolhido
-  │   └─ reply ephemeral "Fonte: ${appName}"
-  │
-  └─ Para a stream atual se estiver tocando antes de trocar fonte
-```
+## Modelo Cloud & Infraestrutura (AWS + Docker)
 
-### `/play`
+### Phase 1: Docker Local & Single Server Container
+Toda a aplicação (Bot Discord + Servidor Web Express/WSS) roda dentro de um container Docker configurado via `docker-compose.yml`.
+
+### Phase 2: AWS Elastic Architecture (On-Demand Dispatcher)
+Para otimizar custos e garantir escalabilidade:
 
 ```
-interactionCreate → /play handler
-  │
-  ├─ Obtém UserSession
-  │   └─ Se não tem selectedSource: reply ephemeral "Use /select primeiro"
-  │
-  ├─ Se já está playing: reply ephemeral "Já está tocando"
-  │
-  ├─ Se paused: player.unpause() + reply ephemeral "Retomado"
-  │
-  ├─ Senão:
-  │   ├─ capturer.start() → PCM Readable stream
-  │   ├─ Pipeline: PCM → encoder → opusReadable
-  │   ├─ resource = createAudioResource(opusReadable, { inputType: StreamType.Opus })
-  │   ├─ player.play(resource)
-  │   ├─ UserSession.isPlaying = true
-  │   └─ reply ephemeral "Tocando áudio do ${sourceType}"
+                  ┌──────────────────────────────┐
+                  │ AWS EC2 (t3.nano)            │
+                  │ Controller / Dispatcher Bot  │
+                  └──────────────┬───────────────┘
+                                 │
+                   (Recebe /play no Discord)
+                                 │
+                ┌────────────────┴────────────────┐
+                ▼                                 ▼
+      [Free User Stream]               [Donor / Premium User]
+  - Subscrita container worker      - Subscrita container worker
+  - Limite rígido: 1 hora            - Sessão ILIMITADA
+  - Auto-terminate após 60 min      - Alta prioridade / recurso dedicado
 ```
 
-### `/pause`
+1. **Dispatcher (`t3.nano`)**:
+   - Mantém o Bot Discord online 24/7 com baixíssimo consumo de memória e CPU.
+   - Escuta comandos slash.
+2. **Workers em Container**:
+   - Ao receber o comando `/play`, se não houver container alocado, o dispatcher inicia um worker ou aloca um slot de transmissão.
+3. **Regra de 1 Hora (Freemium)**:
+   - Contagem regressiva de 60 minutos iniciada no handshake com a página web.
+   - Avisos aos 50 minutos e 59 minutos no Discord.
+   - Encerramento automático e desconexão após 60 minutos se não houver renovação/status de doador.
+4. **Doações & Licença**:
+   - Aceite de doações livre (Patreon / Ko-fi / PIX).
+   - Doadores recebem bypass do limite de 1 hora.
 
-```
-interactionCreate → /pause handler
-  │
-  ├─ Obtém UserSession
-  │   └─ Se não está playing: reply ephemeral "Nada tocando no momento"
-  │
-  ├─ player.pause()
-  ├─ UserSession.isPlaying = false
-  └─ reply ephemeral "Pausado"
-```
+---
 
-### `/leave`
+## Segurança & Criptografia
 
-```
-interactionCreate → /leave handler
-  │
-  ├─ Obtém UserSession
-  │   └─ Se sem connection: reply ephemeral "Não estou em nenhum canal"
-  │
-  ├─ Se isPlaying: capturer.stop() + player.stop()
-  │
-  ├─ connection.destroy()
-  │
-  ├─ Limpa UserSession mantendo registro (ou remove do Map)
-  │
-  └─ reply ephemeral "Desconectado"
-```
+1. **Tokens de Sessão de Uso Único**:
+   - A URL gerada no `/play` contém um token temporário assinado com expiração (ex: 5 minutos para abrir o link).
+   - O link só aceita conexão do usuário que possui a sessão atrelada ao `userId` do Discord.
+2. **Transmissão Criptografada (TLS / WSS)**:
+   - Todo o tráfego de áudio do navegador para o servidor do bot trafega via HTTPS/WSS com certificado TLS (SSL).
+3. **Privacidade de Vídeo**:
+   - O servidor rejeita e descarta automaticamente qualquer pacote que contenha dados de vídeo. Apenas faixas com `kind === 'audio'` são processadas.
 
-## Ciclo de Vida do VoiceConnection
+---
 
-```
-Signalling ──► Connecting ──► Ready ──► (tocando áudio)
-                    ▲              │
-                    │              ▼
-                    │         Disconnected
-                    │              │
-                    │    ┌─────────┴─────────┐
-                    │    ▼                   ▼
-                    │  (recuperável)    (não recuperável)
-                    │    │                   │
-                    │    ▼                   ▼
-                    └─ reconnect          Destroyed
-```
+## Documentação & GitHub Pages
 
-### Tratamento de Desconexão
-
-```ts
-connection.on(VoiceConnectionStatus.Disconnected, async () => {
-  try {
-    // Tenta reconectar em 5s
-    await Promise.race([
-      entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-      entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-    ]);
-  } catch {
-    // Desconexão real — limpa estado e notifica usuário
-    connection.destroy();
-    session.connection = null;
-    // Opcional: tentar reentrar no canal via /join automático
-  }
-});
-```
-
-## Tratamento de Erros
-
-### Estratégia Geral
-
-1. **Erros de captura** (processo nativo morre): reconecta automaticamente se possível, loga erro
-2. **Erros de conexão** (voice disconnect): tenta reconectar por 5s, depois notifica usuário
-3. **Erros de player** (codec falha): loga, tenta recriar pipeline
-4. **Erros de interação** (comando inválido): reply ephemeral com mensagem descritiva
-
-### Eventos de Erro
-
-```ts
-player.on('error', (error) => {
-  logger.error({ err: error, userId }, 'Player error');
-  // player já para automaticamente — notificar usuário
-});
-
-capturer.on('error', (err) => {
-  logger.error({ err, userId, sourceType }, 'Capture error');
-  // Tentar reiniciar captura ou notificar falha
-});
-
-process.on('uncaughtException', (err) => {
-  logger.fatal({ err }, 'Uncaught exception');
-  // Graceful shutdown
-});
-```
-
-## Dependências npm
-
-```json
-{
-  "dependencies": {
-    "discord.js": "^14.x",
-    "@discordjs/voice": "^0.x",
-    "@discordjs/opus": "^0.x",
-    "pino": "^9.x",
-    "pino-pretty": "^11.x"
-  },
-  "devDependencies": {
-    "typescript": "^5.x",
-    "tsx": "^4.x",
-    "@types/node": "^20.x",
-    "eslint": "^9.x",
-    "@typescript-eslint/eslint-plugin": "^8.x",
-    "@typescript-eslint/parser": "^8.x"
-  }
-}
-```
-
-## Configuração (`.env`)
-
-```env
-DISCORD_TOKEN=           # Token do bot (Discord Developer Portal)
-DISCORD_CLIENT_ID=        # Application ID do bot
-DISCORD_GUILD_ID=         # Servidor para testes (guild commands)
-LOG_LEVEL=info            # trace | debug | info | warn | error | fatal
-```
-
-## Segurança
-
-- Token do Discord armazenado apenas em `.env` (nunca commitado)
-- `.env` listado no `.gitignore`
-- Dados de áudio não são armazenados em disco — tudo em memória
-- Comandos não expõem informações de outros usuários (cada um vê seu próprio estado)
-- Intents apenas os necessários (Guilds + GuildVoiceStates)
-
-## Decisões de Design
-
-| Decisão | Motivo |
-|---|---|
-| `StreamType.Opus` sem container Ogg | Menos overhead, não precisa de FFmpeg para Opus |
-| Factory pattern para capturadores | Permite adicionar novos SOs sem alterar o core |
-| UserSession por userId (não por guild) | Um usuário = uma sessão, mesmo em servidores diferentes |
-| Estado volátil (Map em memória) | Simples, rápido. Sem necessidade de persistência |
-| Interface AudioCapturer | Desacopla captura do pipeline de áudio |
-| Push-based Readable stream | PCM chega assincronamente do processo nativo |
-| `@discordjs/opus` (nativo) vs `opusscript` | Performance superior com bindings nativos C |
+- A documentação pública do projeto será publicada utilizando **GitHub Pages**.
+- O código-fonte dos docs residirá na pasta `/docs` do repositório.
+- Incluirá guias de uso dos comandos, passo a passo para doações, tutoriais de compartilhamento de tela no navegador e guia de deploy self-hosted com Docker.

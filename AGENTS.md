@@ -2,57 +2,66 @@
 
 ## Visão Geral
 
-**audio-bridge** é um bot Discord que captura e transmite áudio do PC do usuário para canais de voz do Discord, sem necessidade de compartilhar a tela. O usuário escolhe a fonte de áudio e controla a reprodução via slash commands.
+**audio-bridge** é um bot Discord inovador em Node.js/TypeScript que transmite qualquer áudio do PC/navegador do usuário para canais de voz do Discord via Web Bridge (Screen Share Audio Capture), sem necessidade de instalar aplicativos nativos nem compartilhar a tela no aplicativo do Discord.
 
 ### Problema Resolvido
 
-Compartilhar áudio em calls do Discord hoje exige compartilhar a tela inteira. O audio-bridge permite transmitir apenas o áudio — seja do sistema todo, de um aplicativo específico ou futuramente de uma aba do navegador — diretamente pelo bot no canal de voz.
+Compartilhar áudio de alta qualidade ou de aplicativos específicos nas chamadas do Discord exige o compartilhamento de tela nativo do Discord (que requer permissões, consomem muita banda com vídeo e possuem limitações de licença/plataforma).
 
-## Stack
+Com o **audio-bridge**:
+1. O usuário executa `/play` no Discord.
+2. O bot entra no canal de voz e responde com uma **URL única e segura**.
+3. O usuário abre o link no seu navegador (Chrome, Edge, Firefox, Brave, Safari) e aceita a permissão nativa de compartilhamento de tela/áudio (`navigator.mediaDevices.getDisplayMedia`).
+4. O navegador captura o áudio (sistema todo, aplicativo ou aba do navegador) e transmite de forma criptografada para o servidor do bot.
+5. O bot descarta qualquer sinal de vídeo, processa o áudio PCM/Opus e o retransmite diretamente para o canal de voz do Discord.
+
+## Stack Tecnológica
 
 | Componente | Tecnologia |
 |---|---|
-| Runtime | Node.js 20+ / TypeScript 5.x (strict mode) |
+| Runtime | Node.js 22+ / TypeScript 5.x (strict mode) |
+| Web Server & WS | HTTP/HTTPS + WebSockets / WebRTC (`express` / `fastify` / `ws` / `@roamhq/wrtc` ou `mediasoup`) |
+| Captura Web | Browser API (`navigator.mediaDevices.getDisplayMedia` + AudioContext / MediaRecorder) |
 | Discord | `discord.js` v14 + `@discordjs/voice` |
 | Encoder Opus | `@discordjs/opus` (bindings nativos libopus) |
-| Captura áudio (Linux) | PipeWire/PulseAudio via `parec`, `pactl`, `wpctl` |
-| Captura áudio (Windows) | WASAPI via FFmpeg dshow ou helper nativo |
-| Logging | `pino` |
-| Gerenciamento de processos | `zx` / child_process |
-| Dev tools | `tsx` para dev runner, `tsc` para build |
+| Containerização | Docker & Docker Compose |
+| Cloud / Cloud Infra | AWS EC2 (instância `t3.nano` para orquestração/dispatcher + workers sob demanda) |
+| Dev Tools & Scripts | `tsx` dev runner, `tsc` build, `pino` logger |
 
 ## Estrutura do Projeto
 
 ```
 audio-bridge/
 ├── src/
-│   ├── index.ts                  # Entry point: cria client, registra comandos e eventos
-│   ├── config.ts                 # Config via env vars (token, clientId, guildId)
+│   ├── index.ts                  # Entry point: inicia HTTP server + Discord client
+│   ├── config.ts                 # Config via env vars (tokens, portas, limites AWS)
 │   ├── bot/
 │   │   ├── client.ts             # Discord Client com intents de voz
 │   │   ├── commands/
 │   │   │   ├── index.ts          # Registry: Collection<string, Command>
 │   │   │   ├── join.ts           # /join
 │   │   │   ├── leave.ts          # /leave
-│   │   │   ├── play.ts           # /play
+│   │   │   ├── play.ts           # /play (gera URL de transmissão)
 │   │   │   ├── pause.ts          # /pause
-│   │   │   └── select.ts         # /select (system, app)
+│   │   │   └── status.ts         # /status (exibe tempo de sessão restante)
 │   │   ├── events/
-│   │   │   ├── index.ts          # Registry de event handlers
-│   │   │   └── interactionCreate.ts
-│   │   └── deploy.ts             # Script standalone p/ registrar slash commands
+│   │   └── deploy.ts             # Script p/ registrar slash commands
+│   ├── web/
+│   │   ├── server.ts             # Servidor HTTP/WebSocket p/ receber áudio do navegador
+│   │   ├── routes/               # Rotas web (página de compartilhamento + auth token)
+│   │   └── public/               # Frontend Web (HTML/JS/CSS p/ compartilhamento de tela/áudio)
 │   ├── audio/
-│   │   ├── capturer.ts           # Interface AudioCapturer + factory por SO
-│   │   ├── sources/
-│   │   │   ├── system.ts         # Stage 1 — system audio
-│   │   │   ├── application.ts    # Stage 2 — per-app audio
-│   │   │   └── browser-tab.ts    # Stage 3 — browser tab (futuro)
-│   │   ├── encoder.ts            # Wrapper do OpusEncoder
-│   │   └── streamer.ts           # PCM → Opus frames → Readable → AudioResource
+│   │   ├── receiver.ts           # Recebe chunks/stream de áudio criptografado do Web frontend
+│   │   ├── encoder.ts            # Transforma PCM em Opus frames
+│   │   └── streamer.ts           # Stream Opus -> AudioResource -> Discord Voice
 │   ├── state/
-│   │   └── user-session.ts       # Map<userId, UserSession> — estado por usuário
+│   │   └── user-session.ts       # Map<userId, UserSession> (gerencia tokens, timer 1h, status)
 │   └── utils/
 │       └── logger.ts             # Logger global (pino)
+├── docker/
+│   ├── Dockerfile
+│   └── docker-compose.yml
+├── docs/                         # Documentação p/ GitHub Pages
 ├── package.json
 ├── tsconfig.json
 └── .env.example
@@ -60,15 +69,13 @@ audio-bridge/
 
 ## Comandos Slash
 
-| Comando | Descrição | Subcomandos / Opções |
-|---|---|---|
-| `/join` | Bot entra no canal de voz do usuário | — |
-| `/leave` | Bot sai do canal de voz | — |
-| `/select` | Seleciona a fonte de áudio | `system` — áudio do PC inteiro<br>`app <nome>` — áudio de um aplicativo (Stage 2) |
-| `/play` | Inicia ou retoma o streaming | — |
-| `/pause` | Pausa o streaming | — |
-
-Comandos são **user-scoped**: o estado (fonte selecionada, canal, player) fica vinculado ao `userId` que executou o comando.
+| Comando | Descrição |
+|---|---|
+| `/join` | Bot entra no canal de voz do usuário |
+| `/leave` | Bot sai do canal de voz e encerra a sessão |
+| `/play` | Entra no canal (se necessário) e gera o link seguro para compartilhamento de áudio via navegador |
+| `/pause` | Pausa/retoma a transmissão do áudio |
+| `/status` | Mostra o status da conexão, fonte atual e tempo restante da sessão (1h grátis / ilimitado para doadores) |
 
 ## Como Rodar
 
@@ -78,90 +85,50 @@ npm install
 
 # Configurar variáveis de ambiente
 cp .env.example .env
-# Preencher DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID
 
-# Registrar comandos (uma vez, ou quando comandos mudarem)
-npm run deploy
-
-# Desenvolvimento (hot reload)
+# Executar em ambiente de desenvolvimento (hot reload)
 npm run dev
 
-# Build + produção
-npm run build && npm start
+# Subir via Docker
+docker-compose up --build -d
 ```
 
 ## Convenções de Código
 
 - **TypeScript strict**: `strict: true` no tsconfig. Sempre tipar retornos de função.
-- **Sem classes desnecessárias**: Preferir funções e interfaces. Classes só quando estado + comportamento estão fortemente acoplados.
-- **Factory pattern** para capturadores de áudio: `createCapturer(os, type)` retorna a implementação correta por SO.
-- **Erros**: Sempre propagar com contexto. Usar `logger.error({ err, userId, sourceType }, 'mensagem')`.
-- **Nomes de arquivo**: kebab-case (`user-session.ts`, `browser-tab.ts`).
-- **Comandos**: Cada comando exporta `{ data: SlashCommandBuilder, execute(interaction) }`.
-- **Imports**: Sempre usar `node:` prefix para módulos nativos (`import { spawn } from 'node:child_process'`).
-- **Respostas ephemeral**: Comandos usam `MessageFlags.Ephemeral` para respostas visíveis só ao usuário.
+- **Segurança First**: Validação de tokens temporários de sessão (UUID / HMAC) para cada URL gerada no `/play`. Criptografia TLS/WSS para o áudio trafegado do navegador até o bot.
+- **Descarte Rápido de Vídeo**: O frontend web solicita apenas áudio quando possível ou descarta frames de vídeo imediatamente, garantindo privacidade e uso mínimo de CPU/rede.
+- **Gerenciamento de Recursos Cloud**: Respeitar limite de 1 hora por transmissão na versão gratuita; liberar recursos imediatamente no `/leave` ou no encerramento da aba.
+- **Erros**: Propagar com contexto via `logger.error({ err, userId, sessionId }, 'mensagem')`.
+- **Imports**: Usar prefixo `node:` para módulos nativos.
 
-## Fluxo de Áudio (Core Pipeline)
+## Fluxo de Áudio e Segurança (Browser -> Bot Server -> Discord)
 
 ```
-Fonte de áudio (system/app)
-        │
-        ▼
-[AudioCapturer] — spawna processo nativo, produz stream PCM
-  PCM: s16le, 48000Hz, stereo
-        │
-        ▼
-[OpusEncoder] — @discordjs/opus, frame = 960 samples/ch × 2ch = 1920 samples = 3840 bytes
-        │
-        ▼
-[Readable<OpusFrame>] — stream Node.js de frames Opus (StreamType.Raw)
-        │
-        ▼
-[AudioResource] — createAudioResource(opusStream, { inputType: StreamType.Raw })
-        │
-        ▼
-[AudioPlayer] — player.play(resource)
-        │
-        ▼
-[VoiceConnection] — connection.subscribe(player)
-        │
-        ▼
-Canal de voz Discord (WebRTC/UDP)
+[Navegador do Usuário]
+  │ (Abre URL gerada no /play com Token de Sessão)
+  │ navigator.mediaDevices.getDisplayMedia({ audio: true })
+  │ Criptografia WSS / TLS / WebRTC
+  ▼
+[Servidor Web / AudioReceiver] (Docker / AWS Instance)
+  │ Autentica token de sessão
+  │ Isola apenas a faixa de áudio (descarta vídeo)
+  │ PCM s16le / Opus Buffer
+  ▼
+[OpusEncoder] (@discordjs/opus)
+  ▼
+[AudioPlayer & VoiceConnection]
+  ▼
+Canal de Voz do Discord (WebRTC / UDP)
 ```
 
-## State Management
+## Regras de Negócio e Cloud (AWS / Docker)
 
-Cada usuário tem uma `UserSession` com:
-
-```ts
-interface UserSession {
-  userId: string;
-  guildId: string;
-  voiceChannelId: string | null;
-  connection: VoiceConnection | null;
-  player: AudioPlayer;
-  capturer: AudioCapturer | null;
-  selectedSource: AudioSourceType | null;  // 'system' | 'app' | 'browser-tab'
-  isPlaying: boolean;
-}
-```
-
-Armazenado em `Map<string, UserSession>` com chave `userId`. O estado persiste apenas em memória (volátil).
-
-## Intents Necessários
-
-- `GatewayIntentBits.Guilds` — básico
-- `GatewayIntentBits.GuildVoiceStates` — obrigatório para voz (privileged intent, ativar no portal)
-
-## Scripts npm
-
-```json
-{
-  "dev": "tsx watch src/index.ts",
-  "build": "tsc",
-  "start": "node dist/index.js",
-  "deploy": "tsx src/bot/deploy.ts",
-  "lint": "eslint src/",
-  "typecheck": "tsc --noEmit"
-}
-```
+1. **Docker**: Primeira etapa de deploy. Todo o ambiente (Bot + Web Bridge) é empacotado em container.
+2. **Orquestração AWS**:
+   - Ponto de entrada: Instância `t3.nano` atuando como dispatcher/controller lightweight.
+   - Instâncias/Containers de Worker: Ativados sob demanda quando uma transmissão inicia.
+3. **Tempo de Sessão**:
+   - Usuário Gratuito: 1 hora de transmissão contínua por sessão.
+   - Assinantes / Doadores: Transmissão **ilimitada**.
+   - Doações são abertas e incentivadas para cobrir os custos de infraestrutura AWS.

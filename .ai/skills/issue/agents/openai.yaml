@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Issue"
+  short_description: "Cria issues e confirma entrada no Backlog"
+  default_prompt: "Use $issue para converter o plano atual em uma GitHub Issue e confirmar sua entrada no Backlog do Project Kanban."

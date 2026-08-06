@@ -3,3 +3,4 @@ dist/
 .env
 INVITE.txt
 *.log
+.ai/plans/
